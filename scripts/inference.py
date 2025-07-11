@@ -80,6 +80,16 @@ def main(config, args):
         helper.set_params(cache_interval=3, cache_branch_id=0)
         helper.enable()
 
+    pipeline.vae = pipeline.vae.to(memory_format=torch.channels_last)
+    pipeline.vae.fuse_qkv_projections()
+
+    pipeline.unet = torch.compile(
+        pipeline.unet, mode="max-autotune", fullgraph=True
+    )
+    pipeline.vae = torch.compile(
+        pipeline.vae, mode="max-autotune", fullgraph=True
+    )
+
 
     if args.seed != -1:
         set_seed(args.seed)
@@ -87,7 +97,20 @@ def main(config, args):
         torch.seed()
 
     print(f"Initial seed: {torch.initial_seed()}")
-
+    # for i in range(3):
+    pipeline(
+        video_path=args.video_path,
+        audio_path=args.audio_path,
+        video_out_path=args.video_out_path,
+        num_frames=config.data.num_frames,
+        num_inference_steps=args.inference_steps,
+        guidance_scale=args.guidance_scale,
+        weight_dtype=dtype,
+        width=config.data.resolution,
+        height=config.data.resolution,
+        mask_image_path=config.data.mask_image_path,
+        temp_dir=args.temp_dir,
+    )
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False) as prof:
         pipeline(
             video_path=args.video_path,
