@@ -30,7 +30,7 @@ wandb/
 *.safetensors
 *.ckpt
 *.pt
-
+traces.json
 # data files
 *.mp4
 *.avi

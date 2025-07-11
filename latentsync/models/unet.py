@@ -375,10 +375,10 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
         t_emb = self.time_proj(timesteps)
 
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
+        # timesteps does not contain any weighnning in fp16.ts and will always return f32 tensors
+        # but time_embedding might actually be ru so we need to cast here.
         # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=self.dtype)
+        t_emb = t_emb.to(dtype=torch.float16)
         emb = self.time_embedding(t_emb)
 
         if self.class_embedding is not None:

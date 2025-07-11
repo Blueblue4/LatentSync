@@ -22,6 +22,7 @@ from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
 from DeepCache import DeepCacheSDHelper
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 def main(config, args):
@@ -79,6 +80,7 @@ def main(config, args):
         helper.set_params(cache_interval=3, cache_branch_id=0)
         helper.enable()
 
+
     if args.seed != -1:
         set_seed(args.seed)
     else:
@@ -86,19 +88,23 @@ def main(config, args):
 
     print(f"Initial seed: {torch.initial_seed()}")
 
-    pipeline(
-        video_path=args.video_path,
-        audio_path=args.audio_path,
-        video_out_path=args.video_out_path,
-        num_frames=config.data.num_frames,
-        num_inference_steps=args.inference_steps,
-        guidance_scale=args.guidance_scale,
-        weight_dtype=dtype,
-        width=config.data.resolution,
-        height=config.data.resolution,
-        mask_image_path=config.data.mask_image_path,
-        temp_dir=args.temp_dir,
-    )
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False) as prof:
+        pipeline(
+            video_path=args.video_path,
+            audio_path=args.audio_path,
+            video_out_path=args.video_out_path,
+            num_frames=config.data.num_frames,
+            num_inference_steps=args.inference_steps,
+            guidance_scale=args.guidance_scale,
+            weight_dtype=dtype,
+            width=config.data.resolution,
+            height=config.data.resolution,
+            mask_image_path=config.data.mask_image_path,
+            temp_dir=args.temp_dir,
+        )
+    print(prof.events().key_averages().table(sort_by="cpu_time_total", top_level_events_only=True, row_limit=20))
+    print(prof.key_averages().table(sort_by="cuda_time_total", top_level_events_only=True, row_limit=20))
+    # prof.export_chrome_trace("trace.json")
 
 
 if __name__ == "__main__":
