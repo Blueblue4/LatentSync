@@ -14,6 +14,8 @@
 
 import argparse
 import os
+import time
+
 from omegaconf import OmegaConf
 import torch
 from diffusers import AutoencoderKL, DDIMScheduler
@@ -98,6 +100,8 @@ def main(config, args):
 
     print(f"Initial seed: {torch.initial_seed()}")
     # for i in range(3):
+
+    t = time.time()
     pipeline(
         video_path=args.video_path,
         audio_path=args.audio_path,
@@ -110,8 +114,11 @@ def main(config, args):
         height=config.data.resolution,
         mask_image_path=config.data.mask_image_path,
         temp_dir=args.temp_dir,
+        precompute=args.precompute,
     )
+    print(f"Done in {time.time() - t:.2f} seconds")
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False) as prof:
+        t = time.time()
         pipeline(
             video_path=args.video_path,
             audio_path=args.audio_path,
@@ -124,10 +131,12 @@ def main(config, args):
             height=config.data.resolution,
             mask_image_path=config.data.mask_image_path,
             temp_dir=args.temp_dir,
+            precompute = args.precompute,
         )
+    print(f"Done in {time.time() - t:.2f} seconds")
     print(prof.events().key_averages().table(sort_by="cpu_time_total", top_level_events_only=True, row_limit=20))
     print(prof.key_averages().table(sort_by="cuda_time_total", top_level_events_only=True, row_limit=20))
-    # prof.export_chrome_trace("trace.json")
+    prof.export_chrome_trace("trace.json")
 
 
 if __name__ == "__main__":
@@ -142,6 +151,7 @@ if __name__ == "__main__":
     parser.add_argument("--temp_dir", type=str, default="temp")
     parser.add_argument("--seed", type=int, default=1247)
     parser.add_argument("--enable_deepcache", action="store_true")
+    parser.add_argument("--precompute", action="store_true")
     args = parser.parse_args()
 
     config = OmegaConf.load(args.unet_config_path)

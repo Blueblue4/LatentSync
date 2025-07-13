@@ -309,6 +309,185 @@ class LipsyncPipeline(DiffusionPipeline):
             faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
 
         return video_frames, faces, boxes, affine_matrices
+    
+    def precompute_video_frames(self, video_path: str, temp_dir: str, weight_dtype: torch.dtype, device: torch.device, generator: torch.Generator, num_frames: int, height: int, width: int, do_classifier_free_guidance: bool):
+        """
+        Precompute video frames and save to cache
+        """
+        import pickle
+        import hashlib
+        
+        # Create cache filename based on video path and parameters
+        video_name = os.path.basename(video_path)
+        cache_key = f"{video_name}_{height}_{width}_{do_classifier_free_guidance}"
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+        cache_path = os.path.join(temp_dir, f"precomputed_{cache_hash}.pkl")
+        
+        # Try to load from cache first
+        if os.path.exists(cache_path):
+            print(f"Loading precomputed data from cache: {cache_path}")
+            try:
+                with open(cache_path, 'rb') as f:
+                    cached_data = pickle.load(f)
+                
+                # Move tensors to correct device
+                print("Moving cached tensors to device...")
+                cached_data['faces'] = cached_data['faces'].to(device)
+                cached_data['ref_pixel_values'] = cached_data['ref_pixel_values'].to(device, dtype=weight_dtype)
+                cached_data['masked_pixel_values'] = cached_data['masked_pixel_values'].to(device, dtype=weight_dtype)
+                cached_data['masks'] = cached_data['masks'].to(device, dtype=weight_dtype)
+                cached_data['mask_latents'] = cached_data['mask_latents'].to(device, dtype=weight_dtype)
+                cached_data['masked_image_latents'] = cached_data['masked_image_latents'].to(device, dtype=weight_dtype)
+                cached_data['ref_latents'] = cached_data['ref_latents'].to(device, dtype=weight_dtype)
+                
+                print(f"Successfully loaded cached precomputed data with {len(cached_data['faces'])} frames")
+                return cached_data
+                
+            except Exception as e:
+                print(f"Failed to load cache: {e}. Regenerating...")
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)
+        
+        # Generate precomputed data
+        print("Generating precomputed data...")
+        
+        # Load and process video frames similar to the main pipeline
+        video_frames = read_video(video_path, use_decord=False)
+        # Use a large dummy list to get maximum video processing
+        dummy_chunks = [0] * (len(video_frames) * 2)
+        video_frames, faces, boxes, affine_matrices = self.loop_video(dummy_chunks, video_frames)
+        
+        # Precompute all mask and image processing
+        print(f"Precomputing masks and latents for {len(faces)} frames...")
+        all_ref_pixel_values = []
+        all_masked_pixel_values = []
+        all_masks = []
+        all_mask_latents = []
+        all_masked_image_latents = []
+        all_ref_latents = []
+        
+        # Process in chunks to avoid memory issues
+        chunk_size = num_frames
+        for i in tqdm.tqdm(range(0, len(faces), chunk_size), desc="Precomputing frames..."):
+            chunk_faces = faces[i:i + chunk_size]
+            
+            # Prepare masks and masked images
+            ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
+                chunk_faces, affine_transform=False
+            )
+            
+            # Prepare mask latents
+            mask_latents, masked_image_latents = self.prepare_mask_latents(
+                masks,
+                masked_pixel_values,
+                height,
+                width,
+                weight_dtype,
+                device,
+                generator,
+                do_classifier_free_guidance,
+            )
+            
+            # Prepare image latents
+            ref_latents = self.prepare_image_latents(
+                ref_pixel_values,
+                device,
+                weight_dtype,
+                generator,
+                do_classifier_free_guidance,
+            )
+            
+            all_ref_pixel_values.append(ref_pixel_values)
+            all_masked_pixel_values.append(masked_pixel_values)
+            all_masks.append(masks)
+            all_mask_latents.append(mask_latents)
+            all_masked_image_latents.append(masked_image_latents)
+            all_ref_latents.append(ref_latents)
+        
+        # Concatenate all chunks
+        all_ref_pixel_values = torch.cat(all_ref_pixel_values, dim=0)
+        all_masked_pixel_values = torch.cat(all_masked_pixel_values, dim=0)
+        all_masks = torch.cat(all_masks, dim=0)
+        all_mask_latents = torch.cat(all_mask_latents, dim=2)  # Concatenate along frame dimension
+        all_masked_image_latents = torch.cat(all_masked_image_latents, dim=2)  # Concatenate along frame dimension
+        all_ref_latents = torch.cat(all_ref_latents, dim=2)  # Concatenate along frame dimension
+        
+        precomputed_data = {
+            'video_frames': video_frames,
+            'faces': faces,
+            'boxes': boxes,
+            'affine_matrices': affine_matrices,
+            'ref_pixel_values': all_ref_pixel_values,
+            'masked_pixel_values': all_masked_pixel_values,
+            'masks': all_masks,
+            'mask_latents': all_mask_latents,
+            'masked_image_latents': all_masked_image_latents,
+            'ref_latents': all_ref_latents,
+        }
+        
+        # Save to cache (move tensors to CPU for storage)
+        print(f"Saving precomputed data to cache: {cache_path}")
+        os.makedirs(temp_dir, exist_ok=True)
+        cache_data = {}
+        for key, value in precomputed_data.items():
+            if isinstance(value, torch.Tensor):
+                cache_data[key] = value.cpu()
+            else:
+                cache_data[key] = value
+        
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
+            print("Successfully saved cache")
+        except Exception as e:
+            print(f"Failed to save cache: {e}")
+        
+        return precomputed_data
+
+    def extend_precomputed_data(self, precomputed_data: dict, whisper_chunks_len: int, device: torch.device, weight_dtype: torch.dtype):
+        """
+        Extend precomputed data if it's shorter than required whisper chunks length
+        """
+        current_len = len(precomputed_data['faces'])
+        
+        if current_len >= whisper_chunks_len:
+            # Trim to exact length needed
+            for key in ['video_frames', 'faces', 'boxes', 'affine_matrices', 'ref_pixel_values', 'masked_pixel_values', 'masks']:
+                if isinstance(precomputed_data[key], torch.Tensor):
+                    precomputed_data[key] = precomputed_data[key][:whisper_chunks_len]
+                elif isinstance(precomputed_data[key], np.ndarray):
+                    precomputed_data[key] = precomputed_data[key][:whisper_chunks_len]
+                elif isinstance(precomputed_data[key], list):
+                    precomputed_data[key] = precomputed_data[key][:whisper_chunks_len]
+            
+            # For latent tensors, trim along frame dimension (dim=2)
+            for key in ['mask_latents', 'masked_image_latents', 'ref_latents']:
+                precomputed_data[key] = precomputed_data[key][:, :, :whisper_chunks_len]
+            
+            return precomputed_data
+        
+        # Need to extend the data
+        num_repeats = (whisper_chunks_len // current_len) + 1
+        print(f"Extending precomputed data from {current_len} to {whisper_chunks_len} frames (repeats: {num_repeats})")
+        
+        if num_repeats > 1:
+            # Extend video frames, faces, boxes, affine_matrices by simple repetition
+            precomputed_data['video_frames'] = np.tile(precomputed_data['video_frames'], (num_repeats, 1, 1, 1))[:whisper_chunks_len]
+            precomputed_data['faces'] = precomputed_data['faces'].repeat(num_repeats, 1, 1, 1)[:whisper_chunks_len]
+            precomputed_data['boxes'] = (precomputed_data['boxes'] * num_repeats)[:whisper_chunks_len]
+            precomputed_data['affine_matrices'] = (precomputed_data['affine_matrices'] * num_repeats)[:whisper_chunks_len]
+            
+            # Extend pixel values and masks
+            precomputed_data['ref_pixel_values'] = precomputed_data['ref_pixel_values'].repeat(num_repeats, 1, 1, 1)[:whisper_chunks_len]
+            precomputed_data['masked_pixel_values'] = precomputed_data['masked_pixel_values'].repeat(num_repeats, 1, 1, 1)[:whisper_chunks_len]
+            precomputed_data['masks'] = precomputed_data['masks'].repeat(num_repeats, 1, 1, 1)[:whisper_chunks_len]
+            
+            # Extend latent tensors (along frame dimension)
+            precomputed_data['mask_latents'] = precomputed_data['mask_latents'].repeat(1, 1, num_repeats, 1, 1)[:, :, :whisper_chunks_len]
+            precomputed_data['masked_image_latents'] = precomputed_data['masked_image_latents'].repeat(1, 1, num_repeats, 1, 1)[:, :, :whisper_chunks_len]
+            precomputed_data['ref_latents'] = precomputed_data['ref_latents'].repeat(1, 1, num_repeats, 1, 1)[:, :, :whisper_chunks_len]
+        
+        return precomputed_data
 
     @torch.no_grad()
     def __call__(
@@ -327,9 +506,11 @@ class LipsyncPipeline(DiffusionPipeline):
         eta: float = 0.0,
         mask_image_path: str = "latentsync/utils/mask.png",
         temp_dir: str = "temp",
+        cache_dir: str = "cache",
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        precompute: bool = False,
         **kwargs,
     ):
             # is_train = self.unet.training
@@ -369,14 +550,27 @@ class LipsyncPipeline(DiffusionPipeline):
                 whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
 
                 audio_samples = read_audio(audio_path)
-
+                
             with record_function("_video preprocessing"):
-                video_frames = read_video(video_path, use_decord=False)
-
-                video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+                # check if preprocessed video frames are cached based on video name
+                if precompute:
+                    precomputed_data = self.precompute_video_frames(
+                        video_path, cache_dir, weight_dtype, device, generator,
+                        num_frames, height, width, do_classifier_free_guidance
+                    )
+                    # Extend precomputed data to match whisper chunks length
+                    precomputed_data = self.extend_precomputed_data(
+                        precomputed_data, len(whisper_chunks), device, weight_dtype
+                    )
+                    video_frames = precomputed_data['video_frames']
+                    faces = precomputed_data['faces']
+                    boxes = precomputed_data['boxes']
+                    affine_matrices = precomputed_data['affine_matrices']
+                else:
+                    video_frames = read_video(video_path, use_decord=False)
+                    video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 
                 synced_video_frames = []
-
                 num_channels_latents = self.vae.config.latent_channels
 
             with record_function("_latent preprocessing"):
@@ -390,7 +584,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     device,
                     generator,
                 )
-
+            
             num_inferences = math.ceil(len(whisper_chunks) / num_frames)
             for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
 
@@ -402,33 +596,43 @@ class LipsyncPipeline(DiffusionPipeline):
                         audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
                 else:
                     audio_embeds = None
-                inference_faces = faces[i * num_frames : (i + 1) * num_frames]
+                
                 latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
-                with record_function("_prep mask loop"):
-                    ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
-                        inference_faces, affine_transform=False
-                    )
+                
+                if precompute:
+                    # Use precomputed data - slice the precomputed tensors
+                    ref_pixel_values = precomputed_data['ref_pixel_values'][i * num_frames : (i + 1) * num_frames]
+                    masks = precomputed_data['masks'][i * num_frames : (i + 1) * num_frames]
+                    mask_latents = precomputed_data['mask_latents'][:, :, i * num_frames : (i + 1) * num_frames]
+                    masked_image_latents = precomputed_data['masked_image_latents'][:, :, i * num_frames : (i + 1) * num_frames]
+                    ref_latents = precomputed_data['ref_latents'][:, :, i * num_frames : (i + 1) * num_frames]
+                else:
+                    inference_faces = faces[i * num_frames : (i + 1) * num_frames]
+                    with record_function("_prep mask loop"):
+                        ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
+                            inference_faces, affine_transform=False
+                        )
 
-                    # 7. Prepare mask latent variables
-                    mask_latents, masked_image_latents = self.prepare_mask_latents(
-                        masks,
-                        masked_pixel_values,
-                        height,
-                        width,
-                        weight_dtype,
-                        device,
-                        generator,
-                        do_classifier_free_guidance,
-                    )
-                with record_function("_prep image loop"):
-                    # 8. Prepare image latents
-                    ref_latents = self.prepare_image_latents(
-                        ref_pixel_values,
-                        device,
-                        weight_dtype,
-                        generator,
-                        do_classifier_free_guidance,
-                    )
+                        # 7. Prepare mask latent variables
+                        mask_latents, masked_image_latents = self.prepare_mask_latents(
+                            masks,
+                            masked_pixel_values,
+                            height,
+                            width,
+                            weight_dtype,
+                            device,
+                            generator,
+                            do_classifier_free_guidance,
+                        )
+                    with record_function("_prep image loop"):
+                        # 8. Prepare image latents
+                        ref_latents = self.prepare_image_latents(
+                            ref_pixel_values,
+                            device,
+                            weight_dtype,
+                            generator,
+                            do_classifier_free_guidance,
+                        )
 
                 # 9. Denoising loop
                 num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order

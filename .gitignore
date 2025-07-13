@@ -25,12 +25,13 @@ wandb/
 /venv/
 /detect_results/
 /temp
+/cache
 
 # checkpoint files
 *.safetensors
 *.ckpt
 *.pt
-traces.json
+trace.json
 # data files
 *.mp4
 *.avi
